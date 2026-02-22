@@ -202,13 +202,13 @@ def load_universe() -> pd.DataFrame:
     """Always uses the ticker list defined inside this script."""
     tickers = [
         # Monday
-        "GLX", "DPZ", "AXSM", "D", "STEP", "CREO", "FRGT", "EMA", "FRPT", "EAC", "LINC",
+        "DPZ", "AXSM", "D", "STEP", "FRGT", "EMA", "FRPT", "LINC",
         # Tuesday
-        "HIMS", "BWXT", "KTOS", "KEYS", "PRIM", "DMRE", "JBT", "OVV", "OKE", "OPAD", "PLAB",
+        "HIMS", "BWXT", "KTOS", "KEYS", "PRIM", "JBT", "OVV", "OKE", "OPAD", "PLAB",
         # Wednesday
-        "CIFR", "HD", "DOCN", "NRG", "LDO", "FIS", "XMTR", "AMR", "LTH", "PLNT", "HPQ",
+        "CIFR", "HD", "DOCN", "NRG", "FIS", "XMTR", "AMR", "LTH", "PLNT", "HPQ",
         # Thursday
-        "AMC", "MELI", "CAVA", "AXON", "ZETA", "NVTS", "WDAY", "TEM", "UNIS", "HUT", "TJX", "TRIB",
+        "AMC", "MELI", "CAVA", "AXON", "ZETA", "NVTS", "WDAY", "TEM", "HUT", "TJX", "TRIB",
         # Friday
         "NVDA", "TTD", "CRM", "SNOW", "IONQ", "SNPS", "ARRY", "PSTG", "VICI", "NTNX",
         # Extended List from Search Results
@@ -588,7 +588,7 @@ def decide_candidate(last_price: float, chg_pct: float, tech: dict) -> dict:
 # ---------------------------
 def run_scan() -> pd.DataFrame:
     now_et = get_local_now(TIMEZONE)
-
+    """
     if (not FORCE_RUN) and (now_et.weekday() >= 5):
         print(f"Skipping scan: weekend. ET now={now_et}")
         return pd.DataFrame()
@@ -600,6 +600,8 @@ def run_scan() -> pd.DataFrame:
     if (not SKIP_MARKET_CALENDAR) and (not is_market_day(now_et)):
         print(f"Skipping scan: NYSE holiday. ET now={now_et}")
         return pd.DataFrame()
+
+    """
 
     uni = load_universe()
     symbols = uni["Symbol"].tolist()
@@ -742,7 +744,18 @@ if __name__ == "__main__":
 
     if mode == "once":
         df = run_scan()
-        print(format_report(df))
+        body = format_report(df)
+        print(body)
+
+        now_et = get_local_now(TIMEZONE)
+        subject = f"{SUBJECT_PREFIX} — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
+
+        try:
+            send_email(subject, body)
+            print("Email sent.")
+        except Exception as e:
+            print("EMAIL FAILED:", repr(e))
+            raise
 
         # Comment out if you don't want emails in local testing
         # if (not df.empty) and (df["CandidateType"] != "").any():
@@ -750,7 +763,7 @@ if __name__ == "__main__":
 
     elif mode == "daemon":
         scheduler = BlockingScheduler(timezone=TIMEZONE)
-        scheduler.add_job(run_once_and_email, "cron", day_of_week="mon-fri", minute="0,30")
+        scheduler.add_job(run_once_and_email, "cron", day_of_week="mon-sun", minute="0,30")
         print("Scheduler started: running at :00 and :30 ET, Mon–Fri (with session gating).")
         scheduler.start()
     else:

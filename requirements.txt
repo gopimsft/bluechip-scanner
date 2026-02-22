@@ -1,0 +1,6 @@
+yfinance
+pandas
+lxml
+beautifulsoup4
+apscheduler
+pandas_market_calendars

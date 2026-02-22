@@ -727,9 +727,15 @@ def run_once_and_email() -> None:
     subject = f"{SUBJECT_PREFIX} — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
 
     # Email only when there is at least one CANDIDATE row (DIP/TREND)
-    if (not df.empty) and (df["CandidateType"] != "").any():
-        send_email(subject, body)
+    #if (not df.empty) and (df["CandidateType"] != "").any():
+    #    send_email(subject, body)
 
+    try:
+        send_email(subject, body)
+        print("Email sent.")
+    except Exception as e:
+        print("EMAIL FAILED:", repr(e))
+    raise
 
 if __name__ == "__main__":
     mode = os.getenv("MODE", "once").lower()

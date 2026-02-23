@@ -72,6 +72,12 @@ DROP_THRESHOLD_PCT = float(os.getenv("SCAN_DROP_PCT", "-1.5"))  # scan table inc
 MIN_DIP_PCT = float(os.getenv("MIN_DIP_PCT", "-1.0"))          # Dip-reversion candidates require <= this
 PROFIT_TARGET_PCT = float(os.getenv("PROFIT_TARGET_PCT", "5.0"))
 
+# EntrySignal tagging (adds extra labels; does NOT change candidate logic)
+ENTRY_SMA20_MAX_ABS_PCT = 2.0   # |%BelowSMA20| <= this => "near SMA20"
+ENTRY_MIN_TARGET_PCT = 2.0      # require at least this much room to target for CLEAR_BUY
+ENTRY_RSI_MIN = 40.0
+ENTRY_RSI_MAX = 70.0
+
 MAX_NAMES = int(os.getenv("MAX_NAMES", "500"))
 TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
 SKIP_MARKET_CALENDAR = os.getenv("SKIP_MARKET_CALENDAR", "1") == "1"
@@ -583,6 +589,44 @@ def decide_candidate(last_price: float, chg_pct: float, tech: dict) -> dict:
     }
 
 
+def compute_entry_signal(last_price: float, chg_pct: float, tech: dict, cand: dict) -> str:
+    # Extra tag only (does not affect CandidateType):
+    #   - CLEAR_BUY: TREND + (TrendSignal STRICT/MEDIUM) + near SMA20 + enough room to target + RSI in band
+    #   - WAIT_PULLBACK: TREND + (TrendSignal STRICT/MEDIUM/LOOSE) but not CLEAR_BUY
+    #   - DIP_SETUP: DIP candidate
+    #   - "" otherwise
+    ctype = str(cand.get("CandidateType", "") or "")
+    if ctype == "DIP":
+        return "DIP_SETUP"
+
+    if ctype != "TREND":
+        return ""
+
+    trend_sig = str(cand.get("TrendSignal", "") or "")
+    # only consider strict/medium as "buy-high" quality
+    if trend_sig not in ("STRICT", "MEDIUM"):
+        return "WAIT_PULLBACK"
+
+    rsi = tech.get("rsi14", float("nan")) if tech else float("nan")
+    pct_below_sma20 = cand.get("PctBelowSMA20", None)
+    target_up = cand.get("TargetUpPct", None)
+
+    near_sma20 = False
+    if isinstance(pct_below_sma20, (int, float)) and (pct_below_sma20 == pct_below_sma20):
+        near_sma20 = abs(float(pct_below_sma20)) <= ENTRY_SMA20_MAX_ABS_PCT
+
+    enough_room = False
+    if isinstance(target_up, (int, float)) and (target_up == target_up):
+        enough_room = float(target_up) >= ENTRY_MIN_TARGET_PCT
+
+    rsi_ok = (isinstance(rsi, (int, float)) and (rsi == rsi) and (ENTRY_RSI_MIN <= float(rsi) <= ENTRY_RSI_MAX))
+
+    if near_sma20 and enough_room and rsi_ok:
+        return "CLEAR_BUY"
+
+    return "WAIT_PULLBACK"
+
+
 # ---------------------------
 # Core scan
 # ---------------------------
@@ -635,6 +679,8 @@ def run_scan() -> pd.DataFrame:
 
         cand = decide_candidate(last_price, chg, tech)
 
+        entry_signal = compute_entry_signal(last_price, chg, tech, cand)
+
         if FETCH_NEWS_FOR_ALL or (chg <= DROP_THRESHOLD_PCT) or (cand.get("CandidateType") != ""):
             headlines = fetch_yahoo_news(sym, limit=6)
             reason = classify_drop(headlines)
@@ -657,6 +703,7 @@ def run_scan() -> pd.DataFrame:
             "Within5%MA": bool(within_5_ma),
             "CandidateType": cand["CandidateType"],
             "TrendSignal": cand.get("TrendSignal", ""),
+            "EntrySignal": entry_signal,
             "TargetPrice": cand["TargetPrice"],
             "TargetUp%": cand["TargetUpPct"],
             "TargetReason": cand["TargetReason"],
@@ -711,7 +758,7 @@ def format_report(df: pd.DataFrame) -> str:
                 f"{r['Symbol']}: {r['ChgPct_vsPrevClose']:.2f}%  Last={r['Last']:.2f}  PrevClose={r['PrevClose']:.2f}",
                 f"  RSI14={r['RSI14']}  SMA20={r['SMA20']}  SMA50={r['SMA50']}  SMA200={r['SMA200']}  SwingHigh20={r['SwingHigh20']}",
                 f"  NearestMA={r['NearestMA']}  NearestMAUp%={r['NearestMAUp%']}  Within5%MA={r['Within5%MA']}",
-                f"  TrendSignal={r.get('TrendSignal','')}  CandidateType={r['CandidateType']}  Target={r['TargetPrice']} ({r['TargetUp%']}%)  TargetReason={r['TargetReason']}",
+                f"  TrendSignal={r.get('TrendSignal','')}  EntrySignal={r.get('EntrySignal','')}  CandidateType={r['CandidateType']}  Target={r['TargetPrice']} ({r['TargetUp%']}%)  TargetReason={r['TargetReason']}",
                 f"  %BelowSMA20={r['%BelowSMA20']}  %BelowSMA50={r['%BelowSMA50']}",
                 f"  Why: {r['Why']}",
             ]

@@ -3,7 +3,9 @@ name: Daily stock scan
 on:
   workflow_dispatch:
   schedule:
-    - cron: "45 14 * * 1-5"
+    - cron: "0 1,7,13,19 * * 1-5"  # Mon–Fri UTC: runs Sun 5pm PST onward every 6h
+    - cron: "0 1 * * 6"           # Sat 01:00 UTC = Fri 5pm PST (final run)
+
 
 jobs:
   run-scan:

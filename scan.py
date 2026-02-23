@@ -54,6 +54,11 @@ import pandas_market_calendars as mcal
 FORCE_RUN = True  # True = allow running on weekends (useful for testing). Set to False for normal behavior.
 FORCE_ALL_DAY_WINDOW = True  # True = ignore SESSION_START/END and run 24h (useful for testing)
 
+# Printing toggle
+# - False: print all rows (grouped by TrendSignal)
+# - True:  print only rows that have a non-empty EntrySignal (e.g., CLEAR_BUY / WAIT_PULLBACK / DIP_SETUP)
+PRINT_ONLY_ENTRY_SIGNAL = True
+
 # Trend filter strictness for "buy high, sell higher" style scanning.
 # Options: "LOOSE" | "MEDIUM" | "STRICT"
 # - LOOSE:   Up-ish (Last >= SMA20) + mild red/flat day. (More signals, more false positives)
@@ -210,7 +215,7 @@ def load_universe() -> pd.DataFrame:
         # Monday
         "DPZ", "AXSM", "D", "STEP", "FRGT", "EMA", "FRPT", "LINC",
         # Tuesday
-        "HIMS", "BWXT", "KTOS", "KEYS", "PRIM", "JBT", "OVV", "OKE", "OPAD", "PLAB",
+        "HIMS", "BWXT", "KTOS", "KEYS", "PRIM", "OVV", "OKE", "OPAD", "PLAB",
         # Wednesday
         "CIFR", "HD", "DOCN", "NRG", "FIS", "XMTR", "AMR", "LTH", "PLNT", "HPQ",
         # Thursday
@@ -219,11 +224,8 @@ def load_universe() -> pd.DataFrame:
         "NVDA", "TTD", "CRM", "SNOW", "IONQ", "SNPS", "ARRY", "PSTG", "VICI", "NTNX",
         # Extended List from Search Results
         "WAVE", "CELH", "VST", "ACMR", "EOS", "BIDU", "Q", "RKLB", "WBD", "GCT", "CRWV", 
-        "S", "MARA", "INOD", "DELL", "OPK", "SOUN", "ZS", "DUOL", "COMP", "UUUU", "1DIBS", 
-        "EDI", "GSAT", "VIA", "ARBR", "TCPC", "SUI", "NWN", "AMNE"
-    ]
-    """
-    tickers = [
+        "S", "MARA", "INOD", "DELL", "OPK", "SOUN", "ZS", "DUOL", "COMP", "UUUU",  
+        "GSAT", "VIA", "TCPC", "SUI", "NWN",
         "AAPL","AMGN","AXP","BA","CAT","CRM","CSCO","CVX","DIS","DOW",
         "GS","HD","HON","IBM","INTC","JNJ","JPM","KO","MCD","MMM",
         "MRK","MSFT","NKE","PG","TRV","UNH","V","VZ","WMT", 
@@ -264,7 +266,7 @@ def load_universe() -> pd.DataFrame:
         "oc", "bros", "phm", "qxo", "rrx", "rkt", "rost", "stla", "swk", "luv", 
         "xpo", "zbra", "pgy", "fsly", "mara", "cifr", "sg", "cvlt", "fisv", "net", "dt"
     ]
-    """
+    
     tickers = _normalize_tickers(tickers)
     return pd.DataFrame({"Symbol": tickers})
 
@@ -745,6 +747,8 @@ def format_report(df: pd.DataFrame) -> str:
     lines = header
     for g in group_order:
         gdf = df[df["TrendSignal"] == g].copy()
+        if PRINT_ONLY_ENTRY_SIGNAL:
+            gdf = gdf[gdf["EntrySignal"].astype(str).str.strip() != ""]
         if gdf.empty:
             continue
         gdf = gdf.sort_values("ChgPct_vsPrevClose", ascending=True)

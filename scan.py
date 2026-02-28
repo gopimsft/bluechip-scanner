@@ -37,8 +37,12 @@ import os
 import re
 import math
 import smtplib
+import csv
+from io import StringIO
 from datetime import time
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -54,10 +58,16 @@ import pandas_market_calendars as mcal
 FORCE_RUN = True  # True = allow running on weekends (useful for testing). Set to False for normal behavior.
 FORCE_ALL_DAY_WINDOW = True  # True = ignore SESSION_START/END and run 24h (useful for testing)
 
+# Output formatting
+# - pretty: grouped multi-line blocks (original)
+# - csv:    one row per ticker, comma-separated (easy copy/paste into a .csv)
+OUTPUT_FORMAT = os.getenv("OUTPUT_FORMAT", "csv").strip().lower()  # pretty | csv
+CSV_INCLUDE_HEADER = os.getenv("CSV_INCLUDE_HEADER", "1") == "1"
+
 # Printing toggle
 # - False: print all rows (grouped by TrendSignal)
 # - True:  print only rows that have a non-empty EntrySignal (e.g., CLEAR_BUY / WAIT_PULLBACK / DIP_SETUP)
-PRINT_ONLY_ENTRY_SIGNAL = True
+PRINT_ONLY_ENTRY_SIGNAL = False
 
 # Trend filter strictness for "buy high, sell higher" style scanning.
 # Options: "LOOSE" | "MEDIUM" | "STRICT"
@@ -92,7 +102,12 @@ SESSION_END_ET = os.getenv("SESSION_END_ET", "20:00")
 
 SUBJECT_PREFIX = os.getenv("SUBJECT_PREFIX", "Blue-chip scan")
 
-UNIVERSE_NAME = "SCRIPT_LIST"
+# Universe selection
+# Provide tickers via env var (ideal for GitHub Actions) and fall back to the script list.
+# Supported env vars (first non-empty wins):
+#   TICKERS, SCAN_TICKERS
+TICKERS_ENV_RAW = (os.getenv("TICKERS", "") or os.getenv("SCAN_TICKERS", "")).strip()
+UNIVERSE_NAME = "ENV_TICKERS" if TICKERS_ENV_RAW else "SCRIPT_LIST"
 
 # Performance toggle: fetching Yahoo news for every ticker can be slow and sometimes rate-limited.
 # For "print all tickers" mode, default to fetching news only for meaningful movers/candidates.
@@ -176,14 +191,28 @@ def is_market_day(now_ts: pd.Timestamp) -> bool:
 # ---------------------------
 # Email
 # ---------------------------
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body: str, attachments: Optional[List[Tuple[str, bytes, str]]] = None) -> None:
+    """
+    Send an email. If attachments are provided, each is (filename, bytes_content, mime_type).
+    Example mime_type: "text/csv"
+    """
     smtp_host = os.environ["SMTP_HOST"]
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
     email_user = os.environ["EMAIL_USER"]
     email_pass = os.environ["EMAIL_PASS"]
     email_to = os.environ["EMAIL_TO"]
 
-    msg = MIMEText(body)
+    if attachments:
+        msg = MIMEMultipart()
+        msg.attach(MIMEText(body, "plain"))
+        for fname, content, mime_type in attachments:
+            maintype, subtype = (mime_type.split("/", 1) + ["octet-stream"])[:2]
+            part = MIMEApplication(content, _subtype=subtype)
+            part.add_header("Content-Disposition", "attachment", filename=fname)
+            msg.attach(part)
+    else:
+        msg = MIMEText(body)
+
     msg["Subject"] = subject
     msg["From"] = email_user
     msg["To"] = email_to
@@ -191,7 +220,6 @@ def send_email(subject: str, body: str) -> None:
     with smtplib.SMTP_SSL(smtp_host, smtp_port) as s:
         s.login(email_user, email_pass)
         s.send_message(msg)
-
 
 # ---------------------------
 # Universe
@@ -210,7 +238,19 @@ def _normalize_tickers(tickers: List[str]) -> List[str]:
     return out
 
 def load_universe() -> pd.DataFrame:
-    """Always uses the ticker list defined inside this script."""
+    """
+    Uses env var tickers if provided (ideal for GitHub Actions), otherwise falls back to the
+    ticker list defined inside this script.
+
+    Supported env vars (first non-empty wins): TICKERS, SCAN_TICKERS
+    Example: TICKERS="AAPL,MSFT,NVDA"
+    """
+    raw = (os.getenv("TICKERS", "") or os.getenv("SCAN_TICKERS", "")).strip()
+    if raw:
+        tickers = re.split(r"[\s,;]+", raw)
+        tickers = _normalize_tickers(tickers)
+        return pd.DataFrame({"Symbol": tickers})
+
     tickers = [
         # Monday
         "DPZ", "AXSM", "D", "STEP", "FRGT", "EMA", "FRPT", "LINC",
@@ -721,7 +761,8 @@ def run_scan() -> pd.DataFrame:
     return report
 
 
-def format_report(df: pd.DataFrame) -> str:
+
+def format_report_pretty(df: pd.DataFrame) -> str:
     now_et = get_local_now(TIMEZONE)
     header = [
         f"Scan time (ET): {now_et.strftime('%Y-%m-%d %H:%M:%S %Z')}",
@@ -773,49 +814,118 @@ def format_report(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def format_report_csv(df: pd.DataFrame) -> str:
+    """Return a pure CSV string (no extra preamble lines)."""
+    if df is None or df.empty:
+        # still return header if requested (so you can paste into a CSV and keep columns consistent)
+        cols = [
+            "ticker","change_pct","last","prev_close","rsi14","sma20","sma50","sma200","swing_high_20",
+            "nearest_ma","nearest_ma_up_pct","within5pct_ma",
+            "trend_signal","entry_signal","candidate_type",
+            "target_price","target_up_pct","target_reason",
+            "pct_below_sma20","pct_below_sma50",
+            "why","headlines",
+        ]
+        if CSV_INCLUDE_HEADER:
+            return ",".join(cols)
+        return ""
+
+    # Keep same filtering behavior as pretty output when PRINT_ONLY_ENTRY_SIGNAL=True
+    out_df = df.copy()
+    if PRINT_ONLY_ENTRY_SIGNAL:
+        out_df = out_df[out_df["EntrySignal"].astype(str).str.strip() != ""]
+
+    # Order + rename columns to match "ticker, change, last, prev close, RSI14, SMA20..." (no name=value pairs)
+    col_map = [
+        ("Symbol", "ticker"),
+        ("ChgPct_vsPrevClose", "change_pct"),
+        ("Last", "last"),
+        ("PrevClose", "prev_close"),
+        ("RSI14", "rsi14"),
+        ("SMA20", "sma20"),
+        ("SMA50", "sma50"),
+        ("SMA200", "sma200"),
+        ("SwingHigh20", "swing_high_20"),
+        ("NearestMA", "nearest_ma"),
+        ("NearestMAUp%", "nearest_ma_up_pct"),
+        ("Within5%MA", "within5pct_ma"),
+        ("TrendSignal", "trend_signal"),
+        ("EntrySignal", "entry_signal"),
+        ("CandidateType", "candidate_type"),
+        ("TargetPrice", "target_price"),
+        ("TargetUp%", "target_up_pct"),
+        ("TargetReason", "target_reason"),
+        ("%BelowSMA20", "pct_below_sma20"),
+        ("%BelowSMA50", "pct_below_sma50"),
+        ("Why", "why"),
+        ("Headlines", "headlines"),
+    ]
+
+    cols_in = [c for c, _ in col_map if c in out_df.columns]
+    out_df = out_df[cols_in].rename(columns={c: new for c, new in col_map if c in out_df.columns})
+
+    # Stable ordering
+    sort_cols = []
+    if "trend_signal" in out_df.columns:
+        sort_cols.append("trend_signal")
+    if "change_pct" in out_df.columns:
+        sort_cols.append("change_pct")
+    if sort_cols:
+        out_df = out_df.sort_values(sort_cols, ascending=[True] * len(sort_cols))
+
+    # Convert NaN/None to empty strings so you don't paste "nan" into spreadsheets
+    out_df = out_df.where(out_df.notna(), "")
+
+    # Use csv.writer to safely quote commas/newlines in text fields (Why/Headlines/TargetReason)
+    buf = StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    if CSV_INCLUDE_HEADER:
+        writer.writerow(list(out_df.columns))
+
+    for row in out_df.itertuples(index=False, name=None):
+        writer.writerow(row)
+
+    return buf.getvalue().rstrip("\n")
+
+
+def format_report(df: pd.DataFrame) -> str:
+    """Backwards-compatible formatter selector."""
+    if str(OUTPUT_FORMAT).strip().lower() == "csv":
+        return format_report_csv(df)
+    return format_report_pretty(df)
+
+
 def run_once_and_email() -> None:
     df = run_scan()
+
+    # Console output (respects OUTPUT_FORMAT)
     body = format_report(df)
+    print(body)
+
+    # Always attach a CSV, regardless of the console format.
+    csv_str = format_report_csv(df)
     now_et = get_local_now(TIMEZONE)
     subject = f"{SUBJECT_PREFIX} — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
-
-    # Email only when there is at least one CANDIDATE row (DIP/TREND)
-    #if (not df.empty) and (df["CandidateType"] != "").any():
-    #    send_email(subject, body)
+    fname = f"scan_{now_et.strftime('%Y%m%d_%H%M')}.csv"
 
     try:
-        send_email(subject, body)
-        print("Email sent.")
+        send_email(subject, body, attachments=[(fname, csv_str.encode("utf-8"), "text/csv")])
+        print("Email sent (CSV attached).")
     except Exception as e:
         print("EMAIL FAILED:", repr(e))
-    raise
+        raise
 
 if __name__ == "__main__":
     mode = os.getenv("MODE", "once").lower()
 
     if mode == "once":
-        df = run_scan()
-        body = format_report(df)
-        print(body)
-
-        now_et = get_local_now(TIMEZONE)
-        subject = f"{SUBJECT_PREFIX} — {now_et.strftime('%Y-%m-%d %H:%M ET')}"
-
-        try:
-            send_email(subject, body)
-            print("Email sent.")
-        except Exception as e:
-            print("EMAIL FAILED:", repr(e))
-            raise
-
-        # Comment out if you don't want emails in local testing
-        # if (not df.empty) and (df["CandidateType"] != "").any():
-        #     send_email(f"{SUBJECT_PREFIX} — {get_local_now(TIMEZONE).strftime('%Y-%m-%d %H:%M ET')}", format_report(df))
+        run_once_and_email()
 
     elif mode == "daemon":
         scheduler = BlockingScheduler(timezone=TIMEZONE)
         scheduler.add_job(run_once_and_email, "cron", day_of_week="mon-sun", minute="0,30")
-        print("Scheduler started: running at :00 and :30 ET, Mon–Fri (with session gating).")
+        print("Scheduler started: running at :00 and :30 ET (cron: mon-sun).")
         scheduler.start()
     else:
         raise ValueError("MODE must be 'once' or 'daemon'")

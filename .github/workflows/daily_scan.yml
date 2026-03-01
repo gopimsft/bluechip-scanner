@@ -21,6 +21,7 @@ jobs:
           pip install -r requirements.txt
       - name: Run scan
         env:
+          TICKERS: ${{ secrets.TICKERS }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}

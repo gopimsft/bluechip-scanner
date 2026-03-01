@@ -318,6 +318,43 @@ def pct_change(last_price: float, ref_price: float) -> float:
     if ref_price and ref_price > 0:
         return (last_price / ref_price - 1.0) * 100.0
     return float("nan")
+def _nyse_session_times_et(now_et: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Return (market_open_et, market_close_et) for the NYSE trading day containing now_et.
+    Uses pandas_market_calendars when possible (handles early closes), otherwise falls back
+    to 09:30–16:00 ET.
+    """
+    day = now_et.tz_convert(TIMEZONE).normalize()
+    default_open = day + pd.Timedelta(hours=9, minutes=30)
+    default_close = day + pd.Timedelta(hours=16)
+
+    try:
+        nyse = mcal.get_calendar("NYSE")
+        sched = nyse.schedule(start_date=str(day.date()), end_date=str(day.date()))
+        if sched is None or sched.empty:
+            return default_open, default_close
+
+        row = sched.iloc[0]
+        mkt_open = row.get("market_open", None)
+        mkt_close = row.get("market_close", None)
+        if mkt_open is None or mkt_close is None:
+            return default_open, default_close
+
+        # Ensure tz-aware then convert to TIMEZONE
+        if getattr(mkt_open, "tz", None) is None:
+            mkt_open = pd.Timestamp(mkt_open).tz_localize("UTC")
+        if getattr(mkt_close, "tz", None) is None:
+            mkt_close = pd.Timestamp(mkt_close).tz_localize("UTC")
+
+        return mkt_open.tz_convert(TIMEZONE), mkt_close.tz_convert(TIMEZONE)
+    except Exception:
+        return default_open, default_close
+
+
+def _is_regular_session_et(now_et: pd.Timestamp) -> bool:
+    open_et, close_et = _nyse_session_times_et(now_et)
+    return open_et <= now_et.tz_convert(TIMEZONE) <= close_et
+
 
 def chunked(items: List[str], n: int) -> Iterable[List[str]]:
     for i in range(0, len(items), n):
@@ -325,8 +362,32 @@ def chunked(items: List[str], n: int) -> Iterable[List[str]]:
 
 def fetch_quotes(symbols: List[str]) -> pd.DataFrame:
     """
-    "Last" from intraday bars, "PrevClose" from last daily close (best-effort).
+    "Last" comes from the most recent intraday bar (with pre/post when RUN_PREPOST=True).
+
+    "PrevClose" is chosen to keep % change intuitive:
+      - During regular session: yesterday's *regular-session* close.
+      - After regular close: today's *regular-session* close (so after-hours move is vs the close).
+      - Premarket: yesterday's close (normal).
+
+    Why: Yahoo's daily "Close" for *today* can update intraday, which makes % change look wrong
+    during the regular session if you treat today's evolving value as "PrevClose".
     """
+    now_et = get_local_now(TIMEZONE)
+    now_local = now_et.tz_convert(TIMEZONE)
+    in_regular = _is_regular_session_et(now_et)
+    open_et, close_et = _nyse_session_times_et(now_et)
+    today = now_local.date()
+
+    def _to_tz_series(s: pd.Series) -> pd.Series:
+        idx = s.index
+        if getattr(idx, "tz", None) is None:
+            idx = idx.tz_localize("UTC")
+        else:
+            idx = idx.tz_convert("UTC")
+        s2 = s.copy()
+        s2.index = idx.tz_convert(TIMEZONE)
+        return s2
+
     rows = []
     for batch in chunked(symbols, 50):
         tickers = " ".join(batch)
@@ -371,7 +432,27 @@ def fetch_quotes(symbols: List[str]) -> pd.DataFrame:
 
                 if dclose.empty:
                     continue
+
+                # Default: use last available daily close
                 prev_close = float(dclose.iloc[-1])
+
+                # If today's daily bar exists and we're *in the regular session*,
+                # use yesterday's close as the reference (avoid intraday-updating daily close).
+                last_daily_date = pd.Timestamp(dclose.index[-1]).date()
+                if in_regular and last_daily_date == today and len(dclose) >= 2:
+                    prev_close = float(dclose.iloc[-2])
+
+                # After-hours robustness: if daily hasn't updated to include today's close yet,
+                # approximate today's regular close from intraday bars at/just before market close.
+                if (not in_regular) and (now_local > close_et) and (last_daily_date < today):
+                    s_et = _to_tz_series(last_series)
+                    mask = (
+                        (s_et.index.date == today)
+                        & (s_et.index >= open_et)
+                        & (s_et.index <= close_et)
+                    )
+                    if mask.any():
+                        prev_close = float(s_et.loc[mask].iloc[-1])
 
                 chg = pct_change(last_price, prev_close)
                 rows.append((sym, last_price, prev_close, chg))

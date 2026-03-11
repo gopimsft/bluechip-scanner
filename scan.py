@@ -305,8 +305,7 @@ def load_universe() -> pd.DataFrame:
         "gfs", "gh", "dhi", "ir", "podd", "ip", "len", "mga", "mgm", "odfl", 
         "oc", "bros", "phm", "qxo", "rrx", "rkt", "rost", "stla", "swk", "luv", 
         "xpo", "zbra", "pgy", "fsly", "mara", "cifr", "sg", "cvlt", "fisv", "net", "dt",
-        "PTRN", "BBY", "BOX", "OKTA", "VEEV", "OUST", "WIX", "EVGO", "GTLB", "AEYE", "IOT", "ACHR", "ONON", "ANF", "AEO", "TGT", "AAON", "CIEN", "U", "BULL",
-
+        "PTRN", "AVAV", "BBY", "BOX", "OKTA", "VEEV", "OUST", "WIX", "EVGO", "GTLB", "AEYE", "IOT", "ACHR", "ONON", "ANF", "AEO", "TGT", "AAON", "CIEN", "U", "BULL",
     ]
     
     tickers = _normalize_tickers(tickers)

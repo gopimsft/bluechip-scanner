@@ -253,7 +253,7 @@ def load_universe() -> pd.DataFrame:
 
     tickers = [
         # Monday
-        "DPZ", "AXSM", "D", "STEP", "FRGT", "EMA", "FRPT", "LINC",
+        "NTSK", "DPZ", "AXSM", "D", "STEP", "FRGT", "EMA", "FRPT", "LINC",
         # Tuesday
         "HIMS", "BWXT", "KTOS", "KEYS", "PRIM", "OVV", "OKE", "OPAD", "PLAB",
         # Wednesday

@@ -276,7 +276,7 @@ def load_universe() -> pd.DataFrame:
         "glxy", "enph", "elf", "sym", "cci", "ubs", "cmi", "clne", "mrvl", "mrna", 
         "deck", "cava", "etsy", "bmnr", "path", "tlry", "crwv", "apld", "cpng", "orcl", 
         "corz", "s", "pd", "fivn", "rzlv", "fubo", "ddog", "fig", "pl", "abvx", 
-        "snow", "nvda", "crwd", "ntnx", "veev", "urbn", "ps, "iren", "dell", "baba", 
+        "snow", "nvda", "crwd", "ntnx", "veev", "urbn", "iren", "dell", "baba", 
         "ibm", "hpe", "dlo", "axsm", "hims", "hood", "cvna", "gev", "googl", "rklb", 
         "pins", "smr", "rivn", "vst", "u", "grab", "pltr", "vrt", "ttd", "adbe", 
         "cflt", "lulu", "algn", "ttan", "iot", "snps", "rbrk", "avo", "sail", "fcel", 

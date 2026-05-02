@@ -279,7 +279,7 @@ def load_universe() -> pd.DataFrame:
         "snow", "nvda", "crwd", "ntnx", "veev", "urbn", "iren", "dell", "baba", 
         "ibm", "hpe", "dlo", "axsm", "hims", "hood", "cvna", "gev", "googl", "rklb", 
         "pins", "smr", "rivn", "vst", "u", "grab", "pltr", "vrt", "ttd", "adbe", 
-        "cflt", "lulu", "algn", "ttan", "iot", "snps", "rbrk", "avo", "sail", "fcel", 
+        "lulu", "algn", "ttan", "iot", "snps", "rbrk", "avo", "sail", "fcel", 
         "gtlb", "docu", "ai", "crm", "okta", "mdb", "box", "ncno", "kss", "anf", 
         "hpq", "ntap", "bbwi", "bby", "dks", "gap", "amba", "estc", "woof", "gen", 
         "mndy", "nu", "ce", "wix", "wday", "akam", "abnb", "fisv", "regn", 

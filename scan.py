@@ -261,7 +261,7 @@ def load_universe() -> pd.DataFrame:
         # Thursday
         "AMC", "MELI", "CAVA", "AXON", "ZETA", "NVTS", "WDAY", "TEM", "HUT", "TJX", "TRIB",
         # Friday
-        "NVDA", "TTD", "CRM", "SNOW", "IONQ", "SNPS", "ARRY", "P", "VICI", "NTNX",
+        "NVDA", "TTD", "CRM", "SNOW", "IONQ", "SNPS", "ARRY", "P", "VICI", "NTNX", "P",
         # Extended List from Search Results
         "WAVE", "CELH", "VST", "ACMR", "EOS", "BIDU", "Q", "RKLB", "WBD", "GCT", "CRWV", 
         "S", "MARA", "INOD", "DELL", "OPK", "SOUN", "ZS", "DUOL", "COMP", "UUUU",  

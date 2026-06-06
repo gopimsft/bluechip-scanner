@@ -38,6 +38,7 @@ import re
 import math
 import smtplib
 import csv
+import time as time_mod
 from io import StringIO
 from datetime import time
 from email.mime.text import MIMEText
@@ -120,7 +121,22 @@ INTRADAY_INTERVAL = "2m"   # friendlier than 1m
 INTRADAY_PERIOD = "2d"
 DAILY_LOOKBACK_DAYS = 340  # enough for SMA200 buffer
 
+# ---------------------------
+# Options / game-theory config
+# ---------------------------
 
+ENABLE_OPTIONS = os.getenv("ENABLE_OPTIONS", "0") == "1"
+OPTIONS_MAX_SYMBOLS = int(os.getenv("OPTIONS_MAX_SYMBOLS", "20"))
+OPTIONS_MIN_VOLUME = int(os.getenv("OPTIONS_MIN_VOLUME", "50"))
+OPTIONS_UNUSUAL_VOL_OI = float(os.getenv("OPTIONS_UNUSUAL_VOL_OI", "1.0"))
+OPTIONS_NEAR_MONEY_PCT = float(os.getenv("OPTIONS_NEAR_MONEY_PCT", "15.0"))
+
+# For scoring only: ignore crazy far OTM / deep ITM strikes.
+# This prevents 100%+ OTM LEAP calls from making the stock look falsely bullish.
+SCORING_MAX_ABS_MONEYNESS_PCT = float(os.getenv("SCORING_MAX_ABS_MONEYNESS_PCT", "35.0"))
+
+OPTIONS_SLEEP_SEC = float(os.getenv("OPTIONS_SLEEP_SEC", "0.20"))
+OPTION_BUCKET_NAMES = ["Opt30", "Opt90", "Opt180", "Opt360", "OptLEAP"]
 # ---------------------------
 # Indicators (pure pandas)
 # ---------------------------
@@ -750,6 +766,380 @@ def compute_entry_signal(last_price: float, chg_pct: float, tech: dict, cand: di
 
     return "WAIT_PULLBACK"
 
+# ---------------------------
+# Options scanner
+# ---------------------------
+
+def classify_option_bucket(expiry: str) -> tuple[str | None, int | None]:
+    """
+    Classifies an option expiration into horizon buckets:
+      Opt30   = <= 30 DTE
+      Opt90   = 31-90 DTE
+      Opt180  = 91-180 DTE
+      Opt360  = 181-360 DTE
+      OptLEAP = >360 DTE
+    """
+    try:
+        today = pd.Timestamp.now(TIMEZONE).date()
+        exp_date = pd.Timestamp(expiry).date()
+        dte = (exp_date - today).days
+    except Exception:
+        return None, None
+
+    if dte < 0:
+        return None, dte
+    if dte <= 30:
+        return "Opt30", dte
+    if dte <= 90:
+        return "Opt90", dte
+    if dte <= 180:
+        return "Opt180", dte
+    if dte <= 360:
+        return "Opt360", dte
+    return "OptLEAP", dte
+
+
+def _num_col(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if df is None or df.empty or col not in df.columns:
+        return pd.Series([default] * len(df), index=df.index if df is not None else None)
+    return pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+
+def _summarize_side(
+    df: pd.DataFrame,
+    side: str,
+    last_price: float,
+    expiry: str,
+    dte: int,
+) -> pd.DataFrame:
+    """
+    Normalizes one side of an option chain: calls or puts.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out["side"] = side
+    out["expiry"] = expiry
+    out["dte"] = dte
+
+    out["strike"] = _num_col(out, "strike")
+    out["volume"] = _num_col(out, "volume")
+    out["openInterest"] = _num_col(out, "openInterest")
+    out["impliedVolatility"] = _num_col(out, "impliedVolatility")
+    out["lastPrice"] = _num_col(out, "lastPrice")
+    out["bid"] = _num_col(out, "bid")
+    out["ask"] = _num_col(out, "ask")
+
+    # Premium proxy. Not exact trade premium, but good enough for ranking public-chain data.
+    out["premium_proxy"] = out["volume"] * out["lastPrice"] * 100.0
+
+    # Moneyness:
+    # calls: positive means OTM above spot
+    # puts: positive means OTM below spot, using distance from spot
+    if last_price and last_price > 0:
+        if side == "CALL":
+            out["moneyness_pct"] = (out["strike"] / last_price - 1.0) * 100.0
+        else:
+            out["moneyness_pct"] = (1.0 - out["strike"] / last_price) * 100.0
+        out["abs_moneyness_pct"] = (out["strike"] / last_price - 1.0).abs() * 100.0
+    else:
+        out["moneyness_pct"] = float("nan")
+        out["abs_moneyness_pct"] = float("nan")
+
+    oi_safe = out["openInterest"].replace(0, 1)
+    out["vol_oi"] = out["volume"] / oi_safe
+
+    out["near_money"] = out["abs_moneyness_pct"] <= OPTIONS_NEAR_MONEY_PCT
+    out["unusual"] = (
+        (out["volume"] >= OPTIONS_MIN_VOLUME)
+        & (out["vol_oi"] >= OPTIONS_UNUSUAL_VOL_OI)
+    )
+
+    cols = [
+        "contractSymbol",
+        "side",
+        "expiry",
+        "dte",
+        "strike",
+        "volume",
+        "openInterest",
+        "vol_oi",
+        "impliedVolatility",
+        "lastPrice",
+        "bid",
+        "ask",
+        "premium_proxy",
+        "moneyness_pct",
+        "abs_moneyness_pct",
+        "near_money",
+        "unusual",
+    ]
+    return out[[c for c in cols if c in out.columns]]
+
+
+def _top_contract_label(df: pd.DataFrame, side: str) -> str:
+    """
+    Compact label for the most interesting contract in a bucket.
+    """
+    if df is None or df.empty:
+        return ""
+
+    side_df = df[df["side"] == side].copy()
+    if side_df.empty:
+        return ""
+
+    # Prefer unusual + near-money contracts. If none, use highest volume.
+    interesting = side_df[(side_df["unusual"]) & (side_df["near_money"])].copy()
+    if interesting.empty:
+        interesting = side_df[side_df["unusual"]].copy()
+    if interesting.empty:
+        interesting = side_df.copy()
+
+    interesting = interesting.sort_values(
+        ["volume", "premium_proxy", "vol_oi"],
+        ascending=[False, False, False],
+    )
+
+    r = interesting.iloc[0]
+    exp = str(r.get("expiry", ""))
+    strike = r.get("strike", None)
+    vol = r.get("volume", 0)
+    oi = r.get("openInterest", 0)
+    voi = r.get("vol_oi", 0)
+    iv = r.get("impliedVolatility", 0)
+    mon = r.get("moneyness_pct", 0)
+
+    try:
+        return (
+            f"{exp} {strike:.0f}{'C' if side == 'CALL' else 'P'} "
+            f"vol={vol:.0f} oi={oi:.0f} v/oi={voi:.1f} "
+            f"iv={iv:.0%} mon={mon:.1f}%"
+        )
+    except Exception:
+        return ""
+
+
+def _bucket_signal(bucket: str, bdf: pd.DataFrame, trend_signal: str, entry_signal: str, chg_pct: float) -> str:
+    """
+    Game-theory classification per expiry bucket.
+    This does NOT claim buy/sell direction. It infers likely strategic pressure from public chain data.
+    """
+    if bdf is None or bdf.empty:
+        return ""
+
+    calls = bdf[
+        (bdf["side"] == "CALL")
+        & (bdf["abs_moneyness_pct"] <= SCORING_MAX_ABS_MONEYNESS_PCT)
+    ]
+
+    puts = bdf[
+        (bdf["side"] == "PUT")
+        & (bdf["abs_moneyness_pct"] <= SCORING_MAX_ABS_MONEYNESS_PCT)
+    ]
+
+    call_vol = float(calls["volume"].sum()) if not calls.empty else 0.0
+    put_vol = float(puts["volume"].sum()) if not puts.empty else 0.0
+
+    call_unusual = float(calls.loc[calls["unusual"], "volume"].sum()) if not calls.empty else 0.0
+    put_unusual = float(puts.loc[puts["unusual"], "volume"].sum()) if not puts.empty else 0.0
+
+    near_call_unusual = float(calls.loc[calls["unusual"] & calls["near_money"], "volume"].sum()) if not calls.empty else 0.0
+    near_put_unusual = float(puts.loc[puts["unusual"] & puts["near_money"], "volume"].sum()) if not puts.empty else 0.0
+
+    call_put_ratio = call_vol / max(put_vol, 1.0)
+    unusual_cp_ratio = call_unusual / max(put_unusual, 1.0)
+
+    trend_quality = str(trend_signal or "")
+    entry_quality = str(entry_signal or "")
+
+    # Front-month logic: gamma and chase matter more.
+    if bucket == "Opt30":
+        if near_call_unusual >= OPTIONS_MIN_VOLUME and call_put_ratio >= 1.5 and trend_quality in ("STRICT", "MEDIUM", "LOOSE"):
+            return "CALL_GAMMA_CHASE"
+        if near_put_unusual >= OPTIONS_MIN_VOLUME and put_vol > call_vol * 1.25 and chg_pct < 0:
+            return "PUT_PRESSURE"
+        if call_unusual > 0 and put_unusual > 0:
+            return "TWO_WAY_BATTLE"
+        if call_put_ratio >= 2.0:
+            return "CALL_HEAVY"
+        if call_put_ratio <= 0.5 and put_vol >= OPTIONS_MIN_VOLUME:
+            return "PUT_HEAVY"
+        return "QUIET"
+
+    # 90/180-day logic: tactical swing positioning.
+    if bucket in ("Opt90", "Opt180"):
+        if near_call_unusual >= OPTIONS_MIN_VOLUME and unusual_cp_ratio >= 1.5 and trend_quality in ("STRICT", "MEDIUM"):
+            return "TACTICAL_BULLISH_POSITIONING"
+        if near_call_unusual >= OPTIONS_MIN_VOLUME and entry_quality in ("CLEAR_BUY", "WAIT_PULLBACK"):
+            return "BULLISH_SWING_INTEREST"
+        if near_put_unusual >= OPTIONS_MIN_VOLUME and put_vol > call_vol:
+            return "TACTICAL_HEDGE_OR_BEARISH"
+        if call_put_ratio >= 1.75:
+            return "CALL_LEAN"
+        if call_put_ratio <= 0.6 and put_vol >= OPTIONS_MIN_VOLUME:
+            return "PUT_LEAN"
+        return "QUIET"
+
+    # 360D / LEAP logic: longer-term investors, collars, hedges, thesis bets.
+    if bucket in ("Opt360", "OptLEAP"):
+        if call_unusual >= OPTIONS_MIN_VOLUME and call_put_ratio >= 1.25:
+            return "LONG_TERM_CALL_ACCUMULATION"
+        if put_unusual >= OPTIONS_MIN_VOLUME and put_vol > call_vol * 1.25:
+            return "LONG_TERM_HEDGE"
+        if call_vol >= OPTIONS_MIN_VOLUME and put_vol >= OPTIONS_MIN_VOLUME:
+            return "LONG_TERM_TWO_WAY"
+        return "QUIET"
+
+    return ""
+
+
+def fetch_options_game_theory(symbol: str, last_price: float, trend_signal: str, entry_signal: str, chg_pct: float) -> dict:
+    """
+    Pulls Yahoo/yfinance option chains and returns compact columns for scan output.
+
+    Important:
+      - Public Yahoo chain data gives volume/OI/IV/strike/expiry.
+      - It does NOT reliably tell us buyer vs seller.
+      - So labels are strategic inferences, not proof.
+    """
+    empty = {}
+    for b in OPTION_BUCKET_NAMES:
+        empty[f"{b}_Signal"] = ""
+        empty[f"{b}_CallVol"] = 0
+        empty[f"{b}_PutVol"] = 0
+        empty[f"{b}_CallPutRatio"] = None
+        empty[f"{b}_TopCall"] = ""
+        empty[f"{b}_TopPut"] = ""
+
+    empty["OptBullScore"] = 0
+    empty["OptBearScore"] = 0
+    empty["OptGameSignal"] = ""
+    empty["OptNotes"] = ""
+
+    if not ENABLE_OPTIONS:
+        return empty
+
+    try:
+        tk = yf.Ticker(symbol)
+        expiries = list(tk.options or [])
+    except Exception as e:
+        out = dict(empty)
+        out["OptNotes"] = f"options_error={type(e).__name__}"
+        return out
+
+    if not expiries:
+        out = dict(empty)
+        out["OptNotes"] = "no_options"
+        return out
+
+    by_bucket = {b: [] for b in OPTION_BUCKET_NAMES}
+
+    for expiry in expiries:
+        bucket, dte = classify_option_bucket(expiry)
+        if bucket is None:
+            continue
+
+        try:
+            chain = tk.option_chain(expiry)
+            calls = _summarize_side(chain.calls, "CALL", last_price, expiry, dte)
+            puts = _summarize_side(chain.puts, "PUT", last_price, expiry, dte)
+            both = pd.concat([calls, puts], ignore_index=True)
+            if not both.empty:
+                by_bucket[bucket].append(both)
+        except Exception:
+            continue
+
+        if OPTIONS_SLEEP_SEC > 0:
+            time_mod.sleep(OPTIONS_SLEEP_SEC)
+
+    out = dict(empty)
+
+    bull_score = 0.0
+    bear_score = 0.0
+    notes = []
+
+    bucket_weights = {
+        "Opt30": 1.50,
+        "Opt90": 1.30,
+        "Opt180": 1.10,
+        "Opt360": 0.90,
+        "OptLEAP": 0.80,
+    }
+
+    for bucket in OPTION_BUCKET_NAMES:
+        if not by_bucket[bucket]:
+            continue
+
+        bdf = pd.concat(by_bucket[bucket], ignore_index=True)
+
+        score_bdf = bdf[
+            bdf["abs_moneyness_pct"] <= SCORING_MAX_ABS_MONEYNESS_PCT
+        ].copy()
+
+        if score_bdf.empty:
+            score_bdf = bdf.copy()
+
+        calls = score_bdf[score_bdf["side"] == "CALL"]
+        puts = score_bdf[score_bdf["side"] == "PUT"]
+
+        call_vol = float(calls["volume"].sum()) if not calls.empty else 0.0
+        put_vol = float(puts["volume"].sum()) if not puts.empty else 0.0
+        cp = call_vol / max(put_vol, 1.0)
+
+        signal = _bucket_signal(bucket, score_bdf, trend_signal, entry_signal, chg_pct)
+
+        out[f"{bucket}_Signal"] = signal
+        out[f"{bucket}_CallVol"] = int(call_vol)
+        out[f"{bucket}_PutVol"] = int(put_vol)
+        out[f"{bucket}_CallPutRatio"] = round(cp, 2)
+        out[f"{bucket}_TopCall"] = _top_contract_label(score_bdf, "CALL")
+        out[f"{bucket}_TopPut"] = _top_contract_label(score_bdf, "PUT")
+
+        w = bucket_weights.get(bucket, 1.0)
+
+        if signal in (
+            "CALL_GAMMA_CHASE",
+            "TACTICAL_BULLISH_POSITIONING",
+            "BULLISH_SWING_INTEREST",
+            "LONG_TERM_CALL_ACCUMULATION",
+            "CALL_HEAVY",
+            "CALL_LEAN",
+        ):
+            bull_score += w
+
+        if signal in (
+            "PUT_PRESSURE",
+            "TACTICAL_HEDGE_OR_BEARISH",
+            "LONG_TERM_HEDGE",
+            "PUT_HEAVY",
+            "PUT_LEAN",
+        ):
+            bear_score += w
+
+        if signal and signal != "QUIET":
+            notes.append(f"{bucket}:{signal}")
+
+    out["OptBullScore"] = round(bull_score, 2)
+    out["OptBearScore"] = round(bear_score, 2)
+
+    # Final game-theory label
+    if bull_score >= 2.5 and bull_score >= bear_score + 1.0:
+        out["OptGameSignal"] = "BULLISH_POSITIONING"
+    elif bear_score >= 2.5 and bear_score >= bull_score + 1.0:
+        out["OptGameSignal"] = "BEARISH_OR_HEDGE_PRESSURE"
+    elif bull_score > 0 and bear_score > 0:
+        out["OptGameSignal"] = "TWO_WAY_WAR"
+    elif bull_score > 0:
+        out["OptGameSignal"] = "BULLISH_LEAN"
+    elif bear_score > 0:
+        out["OptGameSignal"] = "BEARISH_OR_HEDGE_LEAN"
+    else:
+        out["OptGameSignal"] = "NO_CLEAR_OPTIONS_SIGNAL"
+
+    out["OptNotes"] = " | ".join(notes[:6])
+    return out
+
 
 # ---------------------------
 # Core scan
@@ -805,6 +1195,22 @@ def run_scan() -> pd.DataFrame:
 
         entry_signal = compute_entry_signal(last_price, chg, tech, cand)
 
+        opt = {}
+        if ENABLE_OPTIONS:
+            if len(report_rows) < OPTIONS_MAX_SYMBOLS:
+                opt = fetch_options_game_theory(
+                    symbol=sym,
+                    last_price=last_price,
+                    trend_signal=cand.get("TrendSignal", ""),
+                    entry_signal=entry_signal,
+                    chg_pct=chg,
+                )
+            else:
+                opt = {
+                    "OptGameSignal": "SKIPPED_OPTIONS_MAX_SYMBOLS",
+                    "OptNotes": f"OPTIONS_MAX_SYMBOLS={OPTIONS_MAX_SYMBOLS}",
+                }
+
         if FETCH_NEWS_FOR_ALL or (chg <= DROP_THRESHOLD_PCT) or (cand.get("CandidateType") != ""):
             headlines = fetch_yahoo_news(sym, limit=6)
             reason = classify_drop(headlines)
@@ -812,7 +1218,7 @@ def run_scan() -> pd.DataFrame:
             # Keep the default label; if you prefer a cleaner output, change to "".
             reason = "(news skipped)"
 
-        report_rows.append({
+        base_row = {
             "Symbol": sym,
             "ChgPct_vsPrevClose": round(chg, 2),
             "Last": round(last_price, 2),
@@ -835,7 +1241,11 @@ def run_scan() -> pd.DataFrame:
             "%BelowSMA50": cand["PctBelowSMA50"],
             "Why": reason,
             "Headlines": " | ".join(headlines[:3]),
-        })
+        }
+
+        base_row.update(opt)
+        report_rows.append(base_row)
+        
 
     report = pd.DataFrame(report_rows)
     if not report.empty:
@@ -939,6 +1349,45 @@ def format_report_csv(df: pd.DataFrame) -> str:
         ("TargetReason", "target_reason"),
         ("%BelowSMA20", "pct_below_sma20"),
         ("%BelowSMA50", "pct_below_sma50"),
+        ("OptGameSignal", "opt_game_signal"),
+        ("OptBullScore", "opt_bull_score"),
+        ("OptBearScore", "opt_bear_score"),
+        ("OptNotes", "opt_notes"),
+
+        ("Opt30_Signal", "opt30_signal"),
+        ("Opt30_CallVol", "opt30_call_vol"),
+        ("Opt30_PutVol", "opt30_put_vol"),
+        ("Opt30_CallPutRatio", "opt30_call_put_ratio"),
+        ("Opt30_TopCall", "opt30_top_call"),
+        ("Opt30_TopPut", "opt30_top_put"),
+
+        ("Opt90_Signal", "opt90_signal"),
+        ("Opt90_CallVol", "opt90_call_vol"),
+        ("Opt90_PutVol", "opt90_put_vol"),
+        ("Opt90_CallPutRatio", "opt90_call_put_ratio"),
+        ("Opt90_TopCall", "opt90_top_call"),
+        ("Opt90_TopPut", "opt90_top_put"),
+
+        ("Opt180_Signal", "opt180_signal"),
+        ("Opt180_CallVol", "opt180_call_vol"),
+        ("Opt180_PutVol", "opt180_put_vol"),
+        ("Opt180_CallPutRatio", "opt180_call_put_ratio"),
+        ("Opt180_TopCall", "opt180_top_call"),
+        ("Opt180_TopPut", "opt180_top_put"),
+
+        ("Opt360_Signal", "opt360_signal"),
+        ("Opt360_CallVol", "opt360_call_vol"),
+        ("Opt360_PutVol", "opt360_put_vol"),
+        ("Opt360_CallPutRatio", "opt360_call_put_ratio"),
+        ("Opt360_TopCall", "opt360_top_call"),
+        ("Opt360_TopPut", "opt360_top_put"),
+
+        ("OptLEAP_Signal", "opt_leap_signal"),
+        ("OptLEAP_CallVol", "opt_leap_call_vol"),
+        ("OptLEAP_PutVol", "opt_leap_put_vol"),
+        ("OptLEAP_CallPutRatio", "opt_leap_call_put_ratio"),
+        ("OptLEAP_TopCall", "opt_leap_top_call"),
+        ("OptLEAP_TopPut", "opt_leap_top_put"),
         ("Why", "why"),
         ("Headlines", "headlines"),
     ]
@@ -992,7 +1441,10 @@ def run_once_and_email() -> None:
     fname = f"scan_{now_et.strftime('%Y%m%d_%H%M')}.csv"
 
     try:
-        send_email(subject, body, attachments=[(fname, csv_str.encode("utf-8"), "text/csv")])
+        #send_email(subject, body, attachments=[(fname, csv_str.encode("utf-8"), "text/csv")])
+
+        csv_bytes = ("\ufeff" + csv_str.replace("\n", "\r\n") + "\r\n").encode("utf-8")
+        send_email(subject, body, attachments=[(fname, csv_bytes, "text/csv")])
         print("Email sent (CSV attached).")
     except Exception as e:
         print("EMAIL FAILED:", repr(e))
@@ -1002,7 +1454,18 @@ if __name__ == "__main__":
     mode = os.getenv("MODE", "once").lower()
 
     if mode == "once":
-        run_once_and_email()
+        if os.getenv("SEND_EMAIL", "0") == "1":
+            run_once_and_email()
+        else:
+            df = run_scan()
+            csv_str = format_report_csv(df)
+            output_file = os.getenv("OUTPUT_FILE", "option_test.csv")
+
+            with open(output_file, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(csv_str.replace("\n", "\r\n"))
+                f.write("\r\n")
+
+            print(f"Wrote CSV: {output_file}")
 
     elif mode == "daemon":
         scheduler = BlockingScheduler(timezone=TIMEZONE)

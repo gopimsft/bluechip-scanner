@@ -23,7 +23,7 @@ jobs:
         env:
           TICKERS: ${{ secrets.TICKERS }}
           ENABLE_OPTIONS: "1"
-          OPTIONS_MAX_SYMBOLS: "12"
+          OPTIONS_MAX_SYMBOLS: "100"
           OPTIONS_SLEEP_SEC: "0.20"
           SCORING_MAX_ABS_MONEYNESS_PCT: "35.0"
           OUTPUT_FORMAT: "pretty"

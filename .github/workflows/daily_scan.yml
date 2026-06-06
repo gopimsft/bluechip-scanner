@@ -22,6 +22,12 @@ jobs:
       - name: Run scan
         env:
           TICKERS: ${{ secrets.TICKERS }}
+          ENABLE_OPTIONS: "1"
+          OPTIONS_MAX_SYMBOLS: "12"
+          OPTIONS_SLEEP_SEC: "0.20"
+          SCORING_MAX_ABS_MONEYNESS_PCT: "35.0"
+          OUTPUT_FORMAT: "pretty"
+          SEND_EMAIL: "1"
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}

@@ -94,6 +94,16 @@ ENTRY_MIN_TARGET_PCT = 2.0      # require at least this much room to target for 
 ENTRY_RSI_MIN = 40.0
 ENTRY_RSI_MAX = 70.0
 
+# Recovery-stage tagging. This does not change candidate selection; it adds a
+# column describing whether a broken stock is basing, reversing, repairing its
+# trend, or back in a confirmed uptrend.
+RECOVERY_BROKEN_BELOW_SMA50_PCT = float(
+    os.getenv("RECOVERY_BROKEN_BELOW_SMA50_PCT", "10.0")
+)
+RECOVERY_SMA50_HOLD_DAYS = int(
+    os.getenv("RECOVERY_SMA50_HOLD_DAYS", "3")
+)
+
 MAX_NAMES = int(os.getenv("MAX_NAMES", "500"))
 TIMEZONE = os.getenv("TIMEZONE", "America/New_York")
 SKIP_MARKET_CALENDAR = os.getenv("SKIP_MARKET_CALENDAR", "1") == "1"
@@ -529,9 +539,56 @@ def compute_technicals(daily_df: pd.DataFrame) -> dict:
         return {}
 
     rsi14 = rsi_wilder(close, 14).iloc[-1]
-    sma20v = sma(close, 20).iloc[-1]
-    sma50v = sma(close, 50).iloc[-1]
+    sma20_series = sma(close, 20)
+    sma50_series = sma(close, 50)
+    sma20v = sma20_series.iloc[-1]
+    sma50v = sma50_series.iloc[-1]
+    sma50_prev = sma50_series.iloc[-2]
     sma200v = sma(close, 200).iloc[-1] if len(close) >= 200 else float("nan")
+
+    # Recovery evidence.
+    hold_days = max(1, RECOVERY_SMA50_HOLD_DAYS)
+    hold_frame = pd.DataFrame({"close": close, "sma50": sma50_series}).dropna().tail(hold_days)
+    holds_sma50 = (
+        len(hold_frame) == hold_days
+        and bool((hold_frame["close"] >= hold_frame["sma50"]).all())
+    )
+
+    higher_low = False
+    no_new_10d_low = False
+    volatility_contracting = False
+
+    if "low" in daily_df.columns and len(daily_df) >= 20:
+        low = daily_df["low"].astype(float)
+        recent_5d_low = float(low.iloc[-5:].min())
+        prior_5d_low = float(low.iloc[-10:-5].min())
+        higher_low = recent_5d_low > prior_5d_low
+
+        # Latest three sessions remain above the lowest low from the prior seven.
+        recent_3d_low = float(low.iloc[-3:].min())
+        prior_7d_low = float(low.iloc[-10:-3].min())
+        no_new_10d_low = recent_3d_low > prior_7d_low
+
+    if {"high", "low"}.issubset(daily_df.columns) and len(daily_df) >= 20:
+        high = daily_df["high"].astype(float)
+        low = daily_df["low"].astype(float)
+        prev_close = close.shift(1)
+        true_range = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        range_pct = true_range.div(prev_close.abs().replace(0.0, float("nan"))) * 100.0
+        range_5d = float(range_pct.tail(5).mean())
+        range_20d = float(range_pct.tail(20).mean())
+        volatility_contracting = (
+            math.isfinite(range_5d)
+            and math.isfinite(range_20d)
+            and range_5d < range_20d
+        )
 
     # 20-day swing high (use "high" if present, otherwise close)
     if "high" in daily_df.columns and len(daily_df["high"].dropna()) >= 20:
@@ -543,10 +600,74 @@ def compute_technicals(daily_df: pd.DataFrame) -> dict:
         "rsi14": float(rsi14) if not pd.isna(rsi14) else float("nan"),
         "sma20": float(sma20v) if not pd.isna(sma20v) else float("nan"),
         "sma50": float(sma50v) if not pd.isna(sma50v) else float("nan"),
+        "sma50_rising": bool(sma50v > sma50_prev) if not pd.isna(sma50_prev) else False,
+        "sma50_falling": bool(sma50v < sma50_prev) if not pd.isna(sma50_prev) else False,
+        "holds_sma50": holds_sma50,
+        "higher_low": higher_low,
+        "no_new_10d_low": no_new_10d_low,
+        "volatility_contracting": volatility_contracting,
         "sma200": float(sma200v) if not pd.isna(sma200v) else float("nan"),
         "swing_high_20": swing_high_20,
         "last_daily_close": float(close.iloc[-1]),
     }
+
+
+def compute_recovery_stage(last_price: float, tech: dict) -> str:
+    """
+    Classify recovery progression:
+
+      BROKEN -> BASING -> EARLY_REVERSAL -> TREND_REPAIR -> CONFIRMED_UPTREND
+
+    TRANSITION means price action does not yet cleanly satisfy one of the named
+    stages. INSUFFICIENT_DATA means required moving-average data is unavailable.
+    """
+    if not tech:
+        return "INSUFFICIENT_DATA"
+
+    sma20v = tech.get("sma20", float("nan"))
+    sma50v = tech.get("sma50", float("nan"))
+    if (
+        not isinstance(last_price, (int, float))
+        or not math.isfinite(float(last_price))
+        or not isinstance(sma20v, (int, float))
+        or not math.isfinite(float(sma20v))
+        or not isinstance(sma50v, (int, float))
+        or not math.isfinite(float(sma50v))
+        or float(sma50v) <= 0
+    ):
+        return "INSUFFICIENT_DATA"
+
+    last = float(last_price)
+    sma20v = float(sma20v)
+    sma50v = float(sma50v)
+    pct_from_sma50 = pct_diff(last, sma50v)
+
+    # Strongest evidence first so stocks graduate through the stages.
+    if (
+        last >= sma20v
+        and last >= sma50v
+        and tech.get("holds_sma50", False)
+        and tech.get("sma50_rising", False)
+    ):
+        return "CONFIRMED_UPTREND"
+
+    if last >= sma50v and tech.get("holds_sma50", False):
+        return "TREND_REPAIR"
+
+    if last >= sma20v and tech.get("higher_low", False):
+        return "EARLY_REVERSAL"
+
+    if tech.get("no_new_10d_low", False) and tech.get("volatility_contracting", False):
+        return "BASING"
+
+    if (
+        not math.isnan(pct_from_sma50)
+        and pct_from_sma50 <= -RECOVERY_BROKEN_BELOW_SMA50_PCT
+        and tech.get("sma50_falling", False)
+    ):
+        return "BROKEN"
+
+    return "TRANSITION"
 
 
 def fetch_yahoo_news(symbol: str, limit: int = 6) -> List[str]:
@@ -1194,6 +1315,7 @@ def run_scan() -> pd.DataFrame:
         cand = decide_candidate(last_price, chg, tech)
 
         entry_signal = compute_entry_signal(last_price, chg, tech, cand)
+        recovery_stage = compute_recovery_stage(last_price, tech)
 
         opt = {}
         if ENABLE_OPTIONS:
@@ -1234,6 +1356,7 @@ def run_scan() -> pd.DataFrame:
             "CandidateType": cand["CandidateType"],
             "TrendSignal": cand.get("TrendSignal", ""),
             "EntrySignal": entry_signal,
+            "RecoveryStage": recovery_stage,
             "TargetPrice": cand["TargetPrice"],
             "TargetUp%": cand["TargetUpPct"],
             "TargetReason": cand["TargetReason"],
@@ -1295,7 +1418,7 @@ def format_report_pretty(df: pd.DataFrame) -> str:
                 f"{r['Symbol']}: {r['ChgPct_vsPrevClose']:.2f}%  Last={r['Last']:.2f}  PrevClose={r['PrevClose']:.2f}",
                 f"  RSI14={r['RSI14']}  SMA20={r['SMA20']}  SMA50={r['SMA50']}  SMA200={r['SMA200']}  SwingHigh20={r['SwingHigh20']}",
                 f"  NearestMA={r['NearestMA']}  NearestMAUp%={r['NearestMAUp%']}  Within5%MA={r['Within5%MA']}",
-                f"  TrendSignal={r.get('TrendSignal','')}  EntrySignal={r.get('EntrySignal','')}  CandidateType={r['CandidateType']}  Target={r['TargetPrice']} ({r['TargetUp%']}%)  TargetReason={r['TargetReason']}",
+                f"  TrendSignal={r.get('TrendSignal','')}  EntrySignal={r.get('EntrySignal','')}  RecoveryStage={r.get('RecoveryStage','')}  CandidateType={r['CandidateType']}  Target={r['TargetPrice']} ({r['TargetUp%']}%)  TargetReason={r['TargetReason']}",
                 f"  %BelowSMA20={r['%BelowSMA20']}  %BelowSMA50={r['%BelowSMA50']}",
                 f"  Why: {r['Why']}",
             ]
@@ -1313,7 +1436,7 @@ def format_report_csv(df: pd.DataFrame) -> str:
         cols = [
             "ticker","change_pct","last","prev_close","rsi14","sma20","sma50","sma200","swing_high_20",
             "nearest_ma","nearest_ma_up_pct","within5pct_ma",
-            "trend_signal","entry_signal","candidate_type",
+            "trend_signal","entry_signal","recovery_stage","candidate_type",
             "target_price","target_up_pct","target_reason",
             "pct_below_sma20","pct_below_sma50",
             "why","headlines",
@@ -1343,6 +1466,7 @@ def format_report_csv(df: pd.DataFrame) -> str:
         ("Within5%MA", "within5pct_ma"),
         ("TrendSignal", "trend_signal"),
         ("EntrySignal", "entry_signal"),
+        ("RecoveryStage", "recovery_stage"),
         ("CandidateType", "candidate_type"),
         ("TargetPrice", "target_price"),
         ("TargetUp%", "target_up_pct"),
